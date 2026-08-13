@@ -1,0 +1,99 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Build and test run IN PARALLEL. A test-harness bug must never stop a
+# build: a failing test still turns the run red, so nothing is hidden,
+# but an artifact always exists.
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests/ -v
+      # build the real window off-screen: catches a GUI that will not
+      # construct, which unit tests cannot see
+      - run: python scripts/smoke_gui.py
+
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller reportlab
+
+      - name: Bundle Tesseract OCR (best effort)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          choco install tesseract -y --no-progress
+          $src = "C:\Program Files\Tesseract-OCR"
+          if (Test-Path $src) {
+            New-Item -ItemType Directory -Force packaging\tesseract | Out-Null
+            Copy-Item "$src\*" packaging\tesseract -Recurse
+          }
+
+      - name: Build with PyInstaller
+        run: pyinstaller pdf2excel.spec --noconfirm
+
+      - name: Fail loudly if a required component is missing
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\PDF to Excel\PDF to Excel.exe")) {
+            Write-Error "Executable missing from bundle"; exit 1
+          }
+          $themes = Get-ChildItem -Recurse -Filter "*.json" `
+                    -Path "dist\PDF to Excel" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match "customtkinter" }
+          if (-not $themes) {
+            Write-Error "CustomTkinter theme files are missing from the bundle - the window would open unstyled"
+            exit 1
+          }
+          Write-Output "Bundle contains the executable and the UI theme files."
+
+      # Real end-to-end check INSIDE the build job: run the packaged
+      # executable, as a user would, on a real PDF, and verify the
+      # spreadsheet it produces figure by figure. This catches what unit
+      # tests cannot — a format module missing from the bundle.
+      # NOTE: the shipped exe is a windowed app with no console, so
+      # PowerShell neither waits for it nor reports a meaningful
+      # $LASTEXITCODE. Start-Process -Wait waits; the checks then read
+      # the app's own written result, which is unambiguous everywhere.
+      - name: End-to-end check of the packaged app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force e2e\input | Out-Null
+          python scripts\make_fixture.py e2e\input\fixture_statement.pdf
+          Start-Process -FilePath "dist\PDF to Excel\PDF to Excel.exe" `
+                        -ArgumentList "--cli","e2e" -Wait -NoNewWindow
+          python scripts\check_result.py e2e PROVEN
+          python scripts\verify_e2e.py e2e
+
+      # Deliberately break something and confirm the tool notices. This
+      # proves the safety net is real rather than decorative.
+      - name: Deliberate-breakage check
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force broken\input | Out-Null
+          python scripts\make_fixture.py broken\input\fixture.pdf
+          python scripts\break_fixture.py broken\input\fixture.pdf
+          Start-Process -FilePath "dist\PDF to Excel\PDF to Excel.exe" `
+                        -ArgumentList "--cli","broken" -Wait -NoNewWindow
+          python scripts\check_result.py broken UNPROVEN
+
+      # Upload the folder itself, NOT a zip of it. GitHub always zips an
+      # artifact on download, so zipping here too gave the user a zip
+      # inside a zip and two unzip steps.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDF-to-Excel-Windows
+          path: dist/PDF to Excel
